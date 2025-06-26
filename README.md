@@ -10,7 +10,7 @@
 
 我们的完整隐私权政策可在以下链接查看：
 
-**🌐 在线查看：** https://jl19831113.github.io/xiulu-privacy-policy/
+**🌐 在线查看：** https://zl19831113.github.io/xiulu-privacy-policy/
 
 ## 📞 联系我们
 
@@ -35,7 +35,7 @@ Xiulu English Reader is a mobile application focused on English e-book reading, 
 
 Our complete privacy policy can be viewed at:
 
-**🌐 View Online:** https://jl19831113.github.io/xiulu-privacy-policy/
+**🌐 View Online:** https://zl19831113.github.io/xiulu-privacy-policy/
 
 ## 📞 Contact Us
 
