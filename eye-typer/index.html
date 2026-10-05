@@ -134,6 +134,7 @@
     <canvas id="overlay"></canvas>
   </div>
   <div id="face-status">正在加载摄像头和模型…</div>
+  <div id="small-warn" style="display:none;color:#ffb74d;font-size:16px;max-width:640px;line-height:1.5">⚠️ 当前屏幕较小。手机屏幕上眼睛左右转动幅度太小，识别会很不准，建议用平板或电脑，并横屏使用。</div>
   <div id="err"></div>
   <button id="btn-start" class="big-btn" disabled>开始标定</button>
   <button id="btn-skip" class="link-btn" style="display:none">使用上次的标定，直接进入打字板</button>
@@ -159,6 +160,7 @@
 <div id="mini-preview"><canvas id="mini-canvas"></canvas></div>
 
 <div id="toolbar" style="display:none">
+  <button id="btn-recenter" title="一点校正（看中心 2 秒）">⌖</button>
   <button id="btn-settings" title="设置">⚙</button>
 </div>
 
@@ -201,7 +203,7 @@ const BOARD = [
 const COLS = 3, ROWS = 3;
 
 /* ---------------- 设置 ---------------- */
-const DEFAULTS = { dwell: 1200, smooth: 5, speak: true, showdot: true, preview: false };
+const DEFAULTS = { dwell: 1200, smooth: 7, speak: true, showdot: true, preview: false };
 let settings = loadJSON("eyetyper.settings", DEFAULTS);
 function loadJSON(k, d) { try { const v = localStorage.getItem(k); return v ? { ...d, ...JSON.parse(v) } : d; } catch { return d; } }
 function saveJSON(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
@@ -296,15 +298,22 @@ function extractFeatures(res) {
     pitch = Math.atan2(r21, r22);
     tz = M[14];
   }
-  const nose = lm[NOSE];
   const h = (l.h + r.h) / 2, v = (l.v + r.v) / 2;
   const lookL = bs(shapes, "eyeLookInLeft") - bs(shapes, "eyeLookOutLeft");
   const lookR = bs(shapes, "eyeLookOutRight") - bs(shapes, "eyeLookInRight");
   const lookUD = (bs(shapes, "eyeLookUpLeft") + bs(shapes, "eyeLookUpRight") - bs(shapes, "eyeLookDownLeft") - bs(shapes, "eyeLookDownRight")) / 2;
   latestBlink = (bs(shapes, "eyeBlinkLeft") + bs(shapes, "eyeBlinkRight")) / 2;
-  const open = (l.open + r.open) / 2;
-  // 特征向量（含常数项）。标定时用岭回归把它映射到屏幕坐标。
-  return [1, h, v, h * h, v * v, h * v, yaw, pitch, nose.x, nose.y, (lookL + lookR) / 2, lookUD, open, l.w + r.w];
+  // 特征向量（含常数项）。前 8 项是眼睛信号，后 2 项是头部角度（回归时加重正则，避免头微动引起漂移）。
+  return [1, h, v, h * h, v * v, h * v, (lookL + lookR) / 2, lookUD, yaw, pitch];
+}
+const HEAD_FEATURE_START = 8;
+
+// 对最近几帧的特征取中位数，压掉关键点抖动
+const FEAT_HIST = [];
+function medianFeatures(f) {
+  FEAT_HIST.push(f); if (FEAT_HIST.length > 5) FEAT_HIST.shift();
+  if (FEAT_HIST.length < 3) return f;
+  return f.map((_, i) => { const a = FEAT_HIST.map(x => x[i]).sort((p, q) => p - q); return a[a.length >> 1]; });
 }
 
 function drawLandmarks(ctx, w, h, lm) {
@@ -334,7 +343,8 @@ function loop() {
 
   faceSeen = !!(res.faceLandmarks && res.faceLandmarks.length);
   const lm = faceSeen ? res.faceLandmarks[0] : null;
-  latestFeatures = faceSeen ? extractFeatures(res) : null;
+  latestFeatures = faceSeen ? medianFeatures(extractFeatures(res)) : null;
+  if (!faceSeen) FEAT_HIST.length = 0;
 
   const startActive = $("#start").classList.contains("active");
   if (startActive) {
@@ -346,6 +356,7 @@ function loop() {
   }
 
   if (calibrating) calibTick();
+  else if (recentering) recenterTick();
   else if ($("#board").classList.contains("active")) boardTick();
 }
 
@@ -360,8 +371,10 @@ const CALIB_ORDER = [4, 0, 2, 8, 6, 1, 5, 7, 3];
 let calibrating = false;
 let calibIdx = 0, calibPhase = "move", calibPhaseT = 0;
 let calibSamples = [];   // {f: features, x, y}
+const MODEL_VERSION = 2;
 let model = loadJSON("eyetyper.model", null);
-if (model && model.wx) btnSkip.style.display = "";
+if (model && (model.v !== MODEL_VERSION || !model.wx)) model = null;   // 旧版本标定作废
+if (model) btnSkip.style.display = "";
 
 function startCalibration() {
   calibSamples = []; calibIdx = 0; calibPhase = "move"; calibPhaseT = performance.now();
@@ -383,7 +396,7 @@ function calibTick() {
   const now = performance.now();
   const el = now - calibPhaseT;
   if (calibPhase === "move") {
-    if (el > 900) { calibPhase = "collect"; calibPhaseT = now; dot.classList.add("collecting"); }
+    if (el > 1100) { calibPhase = "collect"; calibPhaseT = now; dot.classList.add("collecting"); }
     return;
   }
   if (calibPhase === "collect") {
@@ -391,7 +404,7 @@ function calibTick() {
       const [x, y] = CALIB_POINTS[CALIB_ORDER[calibIdx]];
       calibSamples.push({ f: latestFeatures, x, y, idx: calibIdx });
     }
-    if (el > 1500) {
+    if (el > 1300) {
       calibIdx++;
       if (calibIdx >= CALIB_POINTS.length) { finishCalibration(); return; }
       calibPhase = "move"; calibPhaseT = now; placeDot();
@@ -406,32 +419,62 @@ function finishCalibration() {
     alert("标定过程中大部分时间没有检测到脸，请调整位置和光线后重试。");
     show("start"); return;
   }
-  // 标准化特征，便于岭回归
-  const d = calibSamples[0].f.length;
-  const mean = new Array(d).fill(0), std = new Array(d).fill(0);
-  for (const s of calibSamples) for (let i = 0; i < d; i++) mean[i] += s.f[i] / n;
-  for (const s of calibSamples) for (let i = 0; i < d; i++) std[i] += (s.f[i] - mean[i]) ** 2 / n;
-  for (let i = 0; i < d; i++) std[i] = Math.sqrt(std[i]) || 1;
-  mean[0] = 0; std[0] = 1; // 常数项不标准化
-  const X = calibSamples.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
-  const wx = ridge(X, calibSamples.map(s => s.x), 1.0);
-  const wy = ridge(X, calibSamples.map(s => s.y), 1.0);
-  // 训练误差（每个点的平均偏差，屏幕比例）
-  let err = 0;
-  for (let k = 0; k < n; k++) {
-    const px = dotp(wx, X[k]), py = dotp(wy, X[k]);
-    err += Math.hypot(px - calibSamples[k].x, py - calibSamples[k].y);
-  }
-  err /= n;
-  model = { wx, wy, mean, std, err, t: Date.now() };
+  calibSamples = trimOutliers(calibSamples);
+  const fit = fitModel(calibSamples);
+  model = { ...fit, ox: 0, oy: 0, t: Date.now(), v: MODEL_VERSION };
   saveJSON("eyetyper.model", model);
   enterBoard();
+}
+
+// 每个标定点内，去掉偏离中位数太远的样本（眼睛还没看过去、眨眼后的半睁眼等）
+function trimOutliers(samples) {
+  const out = [];
+  const byIdx = {};
+  for (const s of samples) (byIdx[s.idx] ||= []).push(s);
+  for (const grp of Object.values(byIdx)) {
+    const med = [1, 2].map(i => { const a = grp.map(s => s.f[i]).sort((p, q) => p - q); return a[a.length >> 1]; });
+    const mad = [1, 2].map((i, k) => { const a = grp.map(s => Math.abs(s.f[i] - med[k])).sort((p, q) => p - q); return a[a.length >> 1] || 1e-4; });
+    const keep = grp.filter(s => Math.abs(s.f[1] - med[0]) < 3 * mad[0] + 1e-4 && Math.abs(s.f[2] - med[1]) < 3 * mad[1] + 1e-4);
+    out.push(...(keep.length >= 5 ? keep : grp));
+  }
+  return out;
+}
+
+function fitModel(samples) {
+  const n = samples.length;
+  // 标准化特征，便于岭回归
+  const d = samples[0].f.length;
+  const mean = new Array(d).fill(0), std = new Array(d).fill(0);
+  for (const s of samples) for (let i = 0; i < d; i++) mean[i] += s.f[i] / n;
+  for (const s of samples) for (let i = 0; i < d; i++) std[i] += (s.f[i] - mean[i]) ** 2 / n;
+  for (let i = 0; i < d; i++) std[i] = Math.sqrt(std[i]) || 1;
+  mean[0] = 0; std[0] = 1; // 常数项不标准化
+  const X = samples.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
+  // 正则强度随样本数变化：眼睛特征轻罚，头部角度重罚
+  const lambdas = new Array(d).fill(0).map((_, i) => i === 0 ? 0 : i >= HEAD_FEATURE_START ? 0.5 * n : 0.03 * n);
+  const wx = ridge(X, samples.map(s => s.x), lambdas);
+  const wy = ridge(X, samples.map(s => s.y), lambdas);
+  // 留一点交叉验证：轮流拿掉一个标定点，用其余 8 个点预测它，得到更真实的误差
+  const idxs = [...new Set(samples.map(s => s.idx))];
+  let err = 0;
+  if (idxs.length >= 5) {
+    for (const k of idxs) {
+      const tr = samples.filter(s => s.idx !== k), te = samples.filter(s => s.idx === k);
+      const Xt = tr.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
+      const lt = lambdas.map(l => l * tr.length / n);
+      const ax = ridge(Xt, tr.map(s => s.x), lt), ay = ridge(Xt, tr.map(s => s.y), lt);
+      let ex = 0, ey = 0;
+      for (const s of te) { const z = s.f.map((v, i) => (v - mean[i]) / std[i]); ex += dotp(ax, z) / te.length; ey += dotp(ay, z) / te.length; }
+      err += Math.hypot(ex - te[0].x, ey - te[0].y) / idxs.length;
+    }
+  }
+  return { wx, wy, mean, std, err };
 }
 
 function dotp(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
 
 // 岭回归： (XᵀX + λI) w = Xᵀy，高斯消元求解
-function ridge(X, y, lambda) {
+function ridge(X, y, lambdas) {
   const n = X.length, d = X[0].length;
   const A = Array.from({ length: d }, () => new Array(d + 1).fill(0));
   for (let k = 0; k < n; k++) {
@@ -441,7 +484,7 @@ function ridge(X, y, lambda) {
       A[i][d] += row[i] * y[k];
     }
   }
-  for (let i = 1; i < d; i++) A[i][i] += lambda;  // 常数项不惩罚
+  for (let i = 1; i < d; i++) A[i][i] += Array.isArray(lambdas) ? lambdas[i] : lambdas;  // 常数项不惩罚
   for (let c = 0; c < d; c++) {
     let p = c;
     for (let r = c + 1; r < d; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
@@ -460,8 +503,36 @@ function ridge(X, y, lambda) {
 
 function predict(f) {
   const z = f.map((v, i) => (v - model.mean[i]) / model.std[i]);
-  return [dotp(model.wx, z), dotp(model.wy, z)];
+  return [dotp(model.wx, z) + (model.ox || 0), dotp(model.wy, z) + (model.oy || 0)];
 }
+
+/* ---------- 一点快速校正：看屏幕中心 2 秒，只修正整体偏移，用来对付漂移 ---------- */
+let recentering = false, recenterT = 0, recenterBuf = [];
+function startRecenter() {
+  if (!model) return;
+  recentering = true; recenterT = performance.now(); recenterBuf = [];
+  show("calib");
+  $("#toolbar").style.display = "none";
+  dot.style.left = "50%"; dot.style.top = "50%"; dot.classList.add("collecting");
+  calibMsg.textContent = "请看着屏幕中心的蓝点";
+}
+function recenterTick() {
+  const el = performance.now() - recenterT;
+  if (el > 800 && el < 2300 && latestFeatures && latestBlink < 0.5) {
+    const z = latestFeatures.map((v, i) => (v - model.mean[i]) / model.std[i]);
+    recenterBuf.push([dotp(model.wx, z), dotp(model.wy, z)]);
+  }
+  if (el >= 2300) {
+    recentering = false;
+    if (recenterBuf.length >= 8) {
+      const mx = median(recenterBuf.map(p => p[0])), my = median(recenterBuf.map(p => p[1]));
+      model.ox = 0.5 - mx; model.oy = 0.5 - my;
+      saveJSON("eyetyper.model", model);
+    }
+    enterBoard();
+  }
+}
+function median(a) { const b = [...a].sort((p, q) => p - q); return b[b.length >> 1]; }
 
 /* =====================================================================
    3. 平滑（一欧元滤波）
@@ -482,9 +553,9 @@ class OneEuro {
 }
 let fx, fy;
 function makeFilters() {
-  // 平滑 1..10 -> 截止频率 2.0 .. 0.3 Hz
-  const mc = 2.2 - settings.smooth * 0.19;
-  fx = new OneEuro(mc, 0.05); fy = new OneEuro(mc, 0.05);
+  // 平滑 1..10 -> 截止频率 1.5 .. 0.2 Hz
+  const mc = 1.64 - settings.smooth * 0.144;
+  fx = new OneEuro(mc, 0.02); fy = new OneEuro(mc, 0.02);
 }
 
 /* =====================================================================
@@ -580,7 +651,7 @@ function boardTick() {
   statusBox.innerHTML = `${fps.toFixed(0)} 帧/秒<br>${latestBlink > 0.5 ? "闭眼" : "追踪中"}`;
 
   if (now < refractoryUntil) return;
-  const hit = document.elementFromPoint(gx, gy)?.closest?.(".key") || null;
+  const hit = keyAt(gx, gy);
 
   if (hit && hit === gazeKey) {
     lastSeenOnKey = now;
@@ -601,6 +672,21 @@ function boardTick() {
     fire(el);
   }
 }
+// 找视线所在格子。已经停留的格子向外扩 15%，视线要明显进入别的格子才切换。
+function keyAt(x, y) {
+  const keys = grid.children;
+  let best = null, bestD = Infinity;
+  for (const k of keys) {
+    const r = k.getBoundingClientRect();
+    const m = k === gazeKey ? 0.15 * Math.min(r.width, r.height) : 0;
+    if (x >= r.left - m && x <= r.right + m && y >= r.top - m && y <= r.bottom + m) {
+      if (k === gazeKey) return k;
+      const d = Math.hypot(x - (r.left + r.right) / 2, y - (r.top + r.bottom) / 2);
+      if (d < bestD) { bestD = d; best = k; }
+    }
+  }
+  return best;
+}
 function setRing(el, p) { const c = el.querySelector(".fgc"); if (c) c.setAttribute("stroke-dashoffset", String(289 * (1 - p))); }
 
 /* =====================================================================
@@ -612,7 +698,7 @@ function applySettingsUI() {
   sSmooth.value = settings.smooth; $("#s-smooth-v").textContent = settings.smooth;
   sSpeak.checked = settings.speak; sShow.checked = settings.showdot; sPrev.checked = settings.preview;
   $("#mini-preview").classList.toggle("show", settings.preview);
-  $("#s-info").textContent = model ? `标定误差约为屏幕宽度的 ${(model.err * 100).toFixed(1)}%（越小越好，超过 15% 建议重新标定）。标定时间：${new Date(model.t).toLocaleString()}` : "";
+  $("#s-info").textContent = model ? `标定误差约为屏幕的 ${(model.err * 100).toFixed(0)}%（3×3 格子需要低于 17%，低于 10% 才算好；偏高就重新标定）。标定时间：${new Date(model.t).toLocaleString()}` : "";
 }
 function persist() { saveJSON("eyetyper.settings", settings); applySettingsUI(); }
 sDwell.oninput = () => { settings.dwell = +sDwell.value; persist(); };
@@ -621,6 +707,7 @@ sSpeak.onchange = () => { settings.speak = sSpeak.checked; persist(); };
 sShow.onchange = () => { settings.showdot = sShow.checked; persist(); };
 sPrev.onchange = () => { settings.preview = sPrev.checked; persist(); };
 $("#btn-settings").onclick = () => $("#settings").classList.add("open");
+$("#btn-recenter").onclick = () => startRecenter();
 $("#s-close").onclick = () => $("#settings").classList.remove("open");
 $("#s-clear").onclick = () => { tokens = []; renderOutput(); $("#settings").classList.remove("open"); };
 $("#s-recal").onclick = () => { $("#settings").classList.remove("open"); startCalibration(); };
@@ -628,6 +715,7 @@ $("#s-recal").onclick = () => { $("#settings").classList.remove("open"); startCa
 /* =====================================================================
    6. 启动
    ===================================================================== */
+if (Math.max(innerWidth, innerHeight) < 900) $("#small-warn").style.display = "";
 btnStart.onclick = () => { speechSynthesis?.getVoices?.(); startCalibration(); };
 btnSkip.onclick = () => { if (model) enterBoard(); };
 
