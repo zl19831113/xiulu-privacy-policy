@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>眼控打字板</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #1a1e26;
+    --key: #262b36;
+    --key-hover: #37405a;
+    --key-text: #f3f5f9;
+    --accent: #4fc3f7;
+    --accent-2: #ffb74d;
+    --danger: #ef5350;
+    --muted: #8a93a6;
+    --ring: #4fc3f7;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--key-text);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    overflow: hidden; touch-action: manipulation;
+  }
+  button { font-family: inherit; }
+
+  /* ---------- screens ---------- */
+  .screen { position: fixed; inset: 0; display: none; flex-direction: column; }
+  .screen.active { display: flex; }
+
+  /* ---------- start screen ---------- */
+  #start { align-items: center; justify-content: center; padding: 24px; text-align: center; gap: 18px; }
+  #start h1 { font-size: 34px; margin: 0; }
+  #start p { color: var(--muted); font-size: 18px; max-width: 640px; line-height: 1.6; margin: 0; }
+  #preview-wrap { position: relative; width: min(60vw, 420px); aspect-ratio: 4/3; background: #000; border-radius: 16px; overflow: hidden; border: 2px solid #333; }
+  #preview-wrap video, #preview-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  #face-status { font-size: 18px; min-height: 26px; }
+  .big-btn {
+    font-size: 26px; padding: 18px 48px; border-radius: 16px; border: none; cursor: pointer;
+    background: var(--accent); color: #06202c; font-weight: 700;
+  }
+  .big-btn:disabled { background: #3a4150; color: #8a93a6; cursor: default; }
+  .link-btn { background: none; border: none; color: var(--accent); font-size: 17px; cursor: pointer; text-decoration: underline; }
+  #err { color: var(--danger); font-size: 17px; white-space: pre-wrap; max-width: 700px; }
+
+  /* ---------- calibration ---------- */
+  #calib { background: #000; align-items: center; justify-content: center; }
+  #calib-msg { position: absolute; top: 40px; left: 0; right: 0; text-align: center; font-size: 26px; color: #ddd; padding: 0 20px; }
+  #calib-sub { position: absolute; bottom: 40px; left: 0; right: 0; text-align: center; font-size: 18px; color: var(--muted); }
+  #dot {
+    position: absolute; width: 56px; height: 56px; border-radius: 50%;
+    background: radial-gradient(circle, #fff 0 22%, var(--accent) 24% 60%, transparent 62%);
+    transform: translate(-50%, -50%); transition: left .5s ease, top .5s ease; box-shadow: 0 0 30px rgba(79,195,247,.6);
+  }
+  #dot::after {
+    content: ""; position: absolute; inset: -14px; border-radius: 50%;
+    border: 4px solid rgba(255,255,255,.25);
+  }
+  #dot.collecting::after { border-color: var(--accent-2); animation: pulse .6s infinite alternate; }
+  @keyframes pulse { from { transform: scale(.9);} to { transform: scale(1.1);} }
+
+  /* ---------- board ---------- */
+  #board { padding: 10px; gap: 10px; }
+  #output {
+    flex: 0 0 auto; min-height: 92px; background: var(--panel); border-radius: 14px; padding: 12px 16px;
+    font-size: 40px; line-height: 1.3; display: flex; align-items: center; gap: 12px; overflow: hidden;
+  }
+  #output-text { flex: 1; white-space: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+  #output-text::-webkit-scrollbar { display: none; }
+  #output-text .ph { color: var(--muted); font-size: 24px; }
+  #status { font-size: 15px; color: var(--muted); text-align: right; line-height: 1.4; min-width: 120px; margin-right: 52px; }
+  #status .bad { color: var(--danger); }
+  #grid { flex: 1; display: grid; gap: 10px; min-height: 0; }
+  .key {
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    background: var(--key); border-radius: 18px; font-size: clamp(28px, 6vmin, 64px); font-weight: 600;
+    position: relative; overflow: hidden; user-select: none; border: 3px solid transparent; padding: 8px;
+    line-height: 1.15; word-break: break-all;
+  }
+  .key.group { color: var(--accent); }
+  .key.fn { color: var(--accent-2); font-size: clamp(24px, 4.5vmin, 48px); }
+  .key.danger { color: var(--danger); }
+  .key.gaze { background: var(--key-hover); border-color: var(--ring); }
+  .key.fired { background: var(--accent); color: #06202c; }
+  .key .ring { position: absolute; left: 50%; top: 50%; width: 46%; aspect-ratio: 1; transform: translate(-50%,-50%); opacity: 0; pointer-events: none; }
+  .key.gaze .ring { opacity: .9; }
+  .key .ring circle { fill: none; stroke-width: 4; }
+  .key .ring .bgc { stroke: rgba(255,255,255,.12); }
+  .key .ring .fgc { stroke: var(--ring); stroke-linecap: round; transform: rotate(-90deg); transform-origin: 50% 50%; }
+  .key .label { position: relative; z-index: 1; }
+
+  #gaze-dot {
+    position: fixed; width: 22px; height: 22px; border-radius: 50%; background: rgba(79,195,247,.55);
+    border: 2px solid #fff; transform: translate(-50%,-50%); pointer-events: none; z-index: 50; display: none;
+  }
+  #gaze-dot.show { display: block; }
+
+  #toolbar { position: fixed; right: 10px; top: 10px; z-index: 60; display: flex; gap: 8px; }
+  #toolbar button {
+    width: 44px; height: 44px; border-radius: 10px; border: 1px solid #3a4150; background: rgba(26,30,38,.85);
+    color: var(--muted); font-size: 20px; cursor: pointer;
+  }
+
+  /* ---------- settings ---------- */
+  #settings {
+    position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 100; display: none; align-items: center; justify-content: center; padding: 16px;
+  }
+  #settings.open { display: flex; }
+  #settings .panel { background: var(--panel); border-radius: 16px; padding: 22px; width: min(92vw, 520px); max-height: 90vh; overflow: auto; }
+  #settings h2 { margin: 0 0 14px; font-size: 22px; }
+  #settings label { display: flex; align-items: center; justify-content: space-between; gap: 14px; font-size: 18px; margin: 14px 0; }
+  #settings input[type=range] { flex: 1; }
+  #settings .val { min-width: 60px; text-align: right; color: var(--accent); font-variant-numeric: tabular-nums; }
+  #settings .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+  #settings .row button { flex: 1; font-size: 18px; padding: 12px; border-radius: 10px; border: none; background: var(--key); color: var(--key-text); cursor: pointer; }
+  #settings .row button.primary { background: var(--accent); color: #06202c; font-weight: 700; }
+  #settings small { color: var(--muted); display: block; margin-top: 8px; line-height: 1.5; }
+  #mini-preview { position: fixed; left: 10px; bottom: 10px; width: 160px; aspect-ratio: 4/3; border-radius: 10px; overflow: hidden; border: 1px solid #3a4150; z-index: 60; display: none; background: #000; }
+  #mini-preview.show { display: block; }
+  #mini-preview canvas { width: 100%; height: 100%; transform: scaleX(-1); }
+</style>
+</head>
+<body>
+
+<!-- ============ 开始页 ============ -->
+<section id="start" class="screen active">
+  <h1>眼控打字板</h1>
+  <p>把平板放在正前方约 40 到 60 厘米，让脸出现在画面中间。光线要照到脸上，背后不要有强光。准备好后点"开始标定"，接下来会出现 9 个蓝点，请用眼睛依次看着每个点，头尽量保持不动。</p>
+  <div id="preview-wrap">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <div id="face-status">正在加载摄像头和模型…</div>
+  <div id="err"></div>
+  <button id="btn-start" class="big-btn" disabled>开始标定</button>
+  <button id="btn-skip" class="link-btn" style="display:none">使用上次的标定，直接进入打字板</button>
+</section>
+
+<!-- ============ 标定页 ============ -->
+<section id="calib" class="screen">
+  <div id="calib-msg">请看着蓝点</div>
+  <div id="dot"></div>
+  <div id="calib-sub">头保持不动，只转动眼睛。</div>
+</section>
+
+<!-- ============ 打字板 ============ -->
+<section id="board" class="screen">
+  <div id="output">
+    <div id="output-text"><span class="ph">眼睛停在字上，就会打出来</span></div>
+    <div id="status"></div>
+  </div>
+  <div id="grid"></div>
+</section>
+
+<div id="gaze-dot"></div>
+<div id="mini-preview"><canvas id="mini-canvas"></canvas></div>
+
+<div id="toolbar" style="display:none">
+  <button id="btn-settings" title="设置">⚙</button>
+</div>
+
+<!-- ============ 设置 ============ -->
+<div id="settings">
+  <div class="panel">
+    <h2>设置（家属操作）</h2>
+    <label>停留时间 <input type="range" id="s-dwell" min="500" max="3000" step="100"><span class="val" id="s-dwell-v"></span></label>
+    <small>眼睛在一个字上停多久算选中。误选多就调长，太累就调短。</small>
+    <label>平滑程度 <input type="range" id="s-smooth" min="1" max="10" step="1"><span class="val" id="s-smooth-v"></span></label>
+    <small>越大越稳，但反应会慢一点。</small>
+    <label>选中后朗读 <input type="checkbox" id="s-speak"></label>
+    <label>显示视线点 <input type="checkbox" id="s-showdot"></label>
+    <label>显示摄像头小窗 <input type="checkbox" id="s-preview"></label>
+    <div class="row">
+      <button id="s-recal" class="primary">重新标定</button>
+      <button id="s-clear">清空文字</button>
+      <button id="s-close">关闭</button>
+    </div>
+    <small id="s-info"></small>
+  </div>
+</div>
+
+<script type="module">
+/* =====================================================================
+   板面内容：改这里就能换字。每个一级格子是一个分组，分组里最多 8 个词。
+   type: "group" 分组；"text" 直接输出文字；"fn" 功能键。
+   ===================================================================== */
+const BOARD = [
+  { label: "常用", type: "group", items: ["我要喝水", "我疼", "帮我翻身", "叫人来", "要上厕所", "是", "不是", "清空"] },
+  { label: "人", type: "group", items: ["我", "你", "爸", "妈", "医生", "护士", "家人", "谢谢"] },
+  { label: "身体", type: "group", items: ["头", "手", "脚", "背", "胸", "肚子", "嘴", "眼睛"] },
+  { label: "需要", type: "group", items: ["水", "饭", "药", "吸痰", "尿", "大便", "枕头", "被子"] },
+  { label: "感觉", type: "group", items: ["疼", "痒", "热", "冷", "累", "闷", "饿", "渴"] },
+  { label: "动作", type: "group", items: ["要", "不要", "来", "去", "开", "关", "起来", "睡觉"] },
+  { label: "数字", type: "group", items: ["1", "2", "3", "4", "5", "6", "7", "8"] },
+  { label: "删除", type: "fn", fn: "delete" },
+  { label: "朗读", type: "fn", fn: "speak" },
+];
+const COLS = 3, ROWS = 3;
+
+/* ---------------- 设置 ---------------- */
+const DEFAULTS = { dwell: 1200, smooth: 5, speak: true, showdot: true, preview: false };
+let settings = loadJSON("eyetyper.settings", DEFAULTS);
+function loadJSON(k, d) { try { const v = localStorage.getItem(k); return v ? { ...d, ...JSON.parse(v) } : d; } catch { return d; } }
+function saveJSON(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+
+/* ---------------- DOM ---------------- */
+const $ = (s) => document.querySelector(s);
+const video = $("#video"), overlay = $("#overlay"), octx = overlay.getContext("2d");
+const miniCanvas = $("#mini-canvas"), mctx = miniCanvas.getContext("2d");
+const faceStatus = $("#face-status"), errBox = $("#err");
+const btnStart = $("#btn-start"), btnSkip = $("#btn-skip");
+const dot = $("#dot"), calibMsg = $("#calib-msg");
+const grid = $("#grid"), outputText = $("#output-text"), statusBox = $("#status"), gazeDot = $("#gaze-dot");
+
+function show(id) { document.querySelectorAll(".screen").forEach(s => s.classList.toggle("active", s.id === id)); }
+
+/* =====================================================================
+   1. 摄像头 + MediaPipe 人脸关键点
+   ===================================================================== */
+let landmarker = null;
+let lastVideoTime = -1;
+let faceSeen = false;
+let latestFeatures = null;   // 最近一帧的特征向量
+let latestBlink = 0;         // 0..1 两眼闭合程度
+let frameCount = 0, fpsT = performance.now(), fps = 0;
+
+async function loadModel() {
+  // 优先用仓库里自带的文件（国内可访问），失败再退回 CDN。
+  const local = new URL("./vendor/", location.href).href;
+  const cdn = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/";
+  let mod, wasmBase, modelPath;
+  try {
+    mod = await import(local + "vision_bundle.mjs");
+    wasmBase = local + "wasm"; modelPath = local + "face_landmarker.task";
+  } catch (e) {
+    console.warn("本地模型加载失败，改用 CDN", e);
+    mod = await import(cdn + "vision_bundle.mjs");
+    wasmBase = cdn + "wasm";
+    modelPath = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+  }
+  const { FaceLandmarker, FilesetResolver } = mod;
+  const vision = await FilesetResolver.forVisionTasks(wasmBase);
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: modelPath, delegate },
+    runningMode: "VIDEO", numFaces: 1,
+    outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true,
+  });
+  try { landmarker = await FaceLandmarker.createFromOptions(vision, opts("GPU")); }
+  catch (e) { console.warn("GPU 不可用，改用 CPU", e); landmarker = await FaceLandmarker.createFromOptions(vision, opts("CPU")); }
+}
+
+async function startCamera() {
+  const constraints = { audio: false, video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } };
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  video.srcObject = stream;
+  await new Promise(r => { video.onloadedmetadata = () => { video.play(); r(); }; });
+  overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+  miniCanvas.width = 320; miniCanvas.height = 320 * video.videoHeight / video.videoWidth;
+}
+
+// MediaPipe 关键点编号
+const L = { outer: 263, inner: 362, up: 386, down: 374, iris: 473 };   // 被试左眼（画面右侧）
+const R = { outer: 33, inner: 133, up: 159, down: 145, iris: 468 };    // 被试右眼（画面左侧）
+const NOSE = 1;
+
+function eyeFeatures(lm, E) {
+  const a = lm[E.inner], b = lm[E.outer];
+  const ax = b.x - a.x, ay = b.y - a.y;
+  const w = Math.hypot(ax, ay) || 1e-6;
+  const ux = ax / w, uy = ay / w;        // 眼轴方向
+  const vx = -uy, vy = ux;               // 垂直方向
+  const ir = lm[E.iris];
+  const dx = ir.x - a.x, dy = ir.y - a.y;
+  const h = (dx * ux + dy * uy) / w;     // 虹膜沿眼轴位置 0..1
+  const v = (dx * vx + dy * vy) / w;     // 虹膜垂直位置
+  const open = Math.hypot(lm[E.up].x - lm[E.down].x, lm[E.up].y - lm[E.down].y) / w;  // 睁眼程度
+  return { h, v, open, w };
+}
+
+function bs(shapes, name) { const c = shapes.find(c => c.categoryName === name); return c ? c.score : 0; }
+
+function extractFeatures(res) {
+  const lm = res.faceLandmarks[0];
+  const shapes = res.faceBlendshapes?.[0]?.categories || [];
+  const l = eyeFeatures(lm, L), r = eyeFeatures(lm, R);
+  // 头部姿态（旋转矩阵 -> 偏航/俯仰）
+  let yaw = 0, pitch = 0, tz = 0;
+  const M = res.facialTransformationMatrixes?.[0]?.data;
+  if (M) {
+    // 列主序 4x4
+    const r00 = M[0], r10 = M[1], r20 = M[2], r21 = M[6], r22 = M[10];
+    yaw = Math.atan2(-r20, Math.hypot(r00, r10));
+    pitch = Math.atan2(r21, r22);
+    tz = M[14];
+  }
+  const nose = lm[NOSE];
+  const h = (l.h + r.h) / 2, v = (l.v + r.v) / 2;
+  const lookL = bs(shapes, "eyeLookInLeft") - bs(shapes, "eyeLookOutLeft");
+  const lookR = bs(shapes, "eyeLookOutRight") - bs(shapes, "eyeLookInRight");
+  const lookUD = (bs(shapes, "eyeLookUpLeft") + bs(shapes, "eyeLookUpRight") - bs(shapes, "eyeLookDownLeft") - bs(shapes, "eyeLookDownRight")) / 2;
+  latestBlink = (bs(shapes, "eyeBlinkLeft") + bs(shapes, "eyeBlinkRight")) / 2;
+  const open = (l.open + r.open) / 2;
+  // 特征向量（含常数项）。标定时用岭回归把它映射到屏幕坐标。
+  return [1, h, v, h * h, v * v, h * v, yaw, pitch, nose.x, nose.y, (lookL + lookR) / 2, lookUD, open, l.w + r.w];
+}
+
+function drawLandmarks(ctx, w, h, lm) {
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(video, 0, 0, w, h);
+  if (!lm) return;
+  ctx.fillStyle = "#4fc3f7";
+  for (const i of [L.inner, L.outer, L.up, L.down, R.inner, R.outer, R.up, R.down]) {
+    ctx.beginPath(); ctx.arc(lm[i].x * w, lm[i].y * h, Math.max(2, w / 300), 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.fillStyle = "#ffb74d";
+  for (const i of [L.iris, R.iris]) {
+    ctx.beginPath(); ctx.arc(lm[i].x * w, lm[i].y * h, Math.max(3, w / 200), 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function loop() {
+  requestAnimationFrame(loop);
+  if (!landmarker || video.readyState < 2) return;
+  if (video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  let res;
+  try { res = landmarker.detectForVideo(video, performance.now()); } catch (e) { console.error(e); return; }
+  frameCount++;
+  const now = performance.now();
+  if (now - fpsT > 1000) { fps = frameCount * 1000 / (now - fpsT); frameCount = 0; fpsT = now; }
+
+  faceSeen = !!(res.faceLandmarks && res.faceLandmarks.length);
+  const lm = faceSeen ? res.faceLandmarks[0] : null;
+  latestFeatures = faceSeen ? extractFeatures(res) : null;
+
+  const startActive = $("#start").classList.contains("active");
+  if (startActive) {
+    drawLandmarks(octx, overlay.width, overlay.height, lm);
+    faceStatus.textContent = faceSeen ? "✅ 已检测到脸，可以开始" : "❌ 没有检测到脸，请调整位置或光线";
+    faceStatus.style.color = faceSeen ? "#81c784" : "#ef5350";
+  } else if (settings.preview) {
+    drawLandmarks(mctx, miniCanvas.width, miniCanvas.height, lm);
+  }
+
+  if (calibrating) calibTick();
+  else if ($("#board").classList.contains("active")) boardTick();
+}
+
+/* =====================================================================
+   2. 标定：9 个点，岭回归把特征映射到屏幕坐标
+   ===================================================================== */
+const CALIB_POINTS = [];
+for (const y of [0.12, 0.5, 0.88]) for (const x of [0.1, 0.5, 0.9]) CALIB_POINTS.push([x, y]);
+// 顺序打乱一点，避免总是从同一方向移过来
+const CALIB_ORDER = [4, 0, 2, 8, 6, 1, 5, 7, 3];
+
+let calibrating = false;
+let calibIdx = 0, calibPhase = "move", calibPhaseT = 0;
+let calibSamples = [];   // {f: features, x, y}
+let model = loadJSON("eyetyper.model", null);
+if (model && model.wx) btnSkip.style.display = "";
+
+function startCalibration() {
+  calibSamples = []; calibIdx = 0; calibPhase = "move"; calibPhaseT = performance.now();
+  calibrating = true;
+  show("calib");
+  $("#toolbar").style.display = "none";
+  placeDot();
+}
+
+function placeDot() {
+  const [x, y] = CALIB_POINTS[CALIB_ORDER[calibIdx]];
+  dot.style.left = (x * 100) + "%";
+  dot.style.top = (y * 100) + "%";
+  dot.classList.remove("collecting");
+  calibMsg.textContent = `请看着蓝点（${calibIdx + 1} / ${CALIB_POINTS.length}）`;
+}
+
+function calibTick() {
+  const now = performance.now();
+  const el = now - calibPhaseT;
+  if (calibPhase === "move") {
+    if (el > 900) { calibPhase = "collect"; calibPhaseT = now; dot.classList.add("collecting"); }
+    return;
+  }
+  if (calibPhase === "collect") {
+    if (latestFeatures && latestBlink < 0.5) {
+      const [x, y] = CALIB_POINTS[CALIB_ORDER[calibIdx]];
+      calibSamples.push({ f: latestFeatures, x, y, idx: calibIdx });
+    }
+    if (el > 1500) {
+      calibIdx++;
+      if (calibIdx >= CALIB_POINTS.length) { finishCalibration(); return; }
+      calibPhase = "move"; calibPhaseT = now; placeDot();
+    }
+  }
+}
+
+function finishCalibration() {
+  calibrating = false;
+  const n = calibSamples.length;
+  if (n < 40) {
+    alert("标定过程中大部分时间没有检测到脸，请调整位置和光线后重试。");
+    show("start"); return;
+  }
+  // 标准化特征，便于岭回归
+  const d = calibSamples[0].f.length;
+  const mean = new Array(d).fill(0), std = new Array(d).fill(0);
+  for (const s of calibSamples) for (let i = 0; i < d; i++) mean[i] += s.f[i] / n;
+  for (const s of calibSamples) for (let i = 0; i < d; i++) std[i] += (s.f[i] - mean[i]) ** 2 / n;
+  for (let i = 0; i < d; i++) std[i] = Math.sqrt(std[i]) || 1;
+  mean[0] = 0; std[0] = 1; // 常数项不标准化
+  const X = calibSamples.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
+  const wx = ridge(X, calibSamples.map(s => s.x), 1.0);
+  const wy = ridge(X, calibSamples.map(s => s.y), 1.0);
+  // 训练误差（每个点的平均偏差，屏幕比例）
+  let err = 0;
+  for (let k = 0; k < n; k++) {
+    const px = dotp(wx, X[k]), py = dotp(wy, X[k]);
+    err += Math.hypot(px - calibSamples[k].x, py - calibSamples[k].y);
+  }
+  err /= n;
+  model = { wx, wy, mean, std, err, t: Date.now() };
+  saveJSON("eyetyper.model", model);
+  enterBoard();
+}
+
+function dotp(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
+
+// 岭回归： (XᵀX + λI) w = Xᵀy，高斯消元求解
+function ridge(X, y, lambda) {
+  const n = X.length, d = X[0].length;
+  const A = Array.from({ length: d }, () => new Array(d + 1).fill(0));
+  for (let k = 0; k < n; k++) {
+    const row = X[k];
+    for (let i = 0; i < d; i++) {
+      for (let j = 0; j < d; j++) A[i][j] += row[i] * row[j];
+      A[i][d] += row[i] * y[k];
+    }
+  }
+  for (let i = 1; i < d; i++) A[i][i] += lambda;  // 常数项不惩罚
+  for (let c = 0; c < d; c++) {
+    let p = c;
+    for (let r = c + 1; r < d; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    [A[c], A[p]] = [A[p], A[c]];
+    const piv = A[c][c] || 1e-9;
+    for (let j = c; j <= d; j++) A[c][j] /= piv;
+    for (let r = 0; r < d; r++) {
+      if (r === c) continue;
+      const f = A[r][c];
+      if (!f) continue;
+      for (let j = c; j <= d; j++) A[r][j] -= f * A[c][j];
+    }
+  }
+  return A.map(r => r[d]);
+}
+
+function predict(f) {
+  const z = f.map((v, i) => (v - model.mean[i]) / model.std[i]);
+  return [dotp(model.wx, z), dotp(model.wy, z)];
+}
+
+/* =====================================================================
+   3. 平滑（一欧元滤波）
+   ===================================================================== */
+class OneEuro {
+  constructor(minCutoff, beta, dCutoff = 1) { this.mc = minCutoff; this.beta = beta; this.dc = dCutoff; this.x = null; this.dx = 0; this.t = null; }
+  alpha(cut, dt) { const tau = 1 / (2 * Math.PI * cut); return 1 / (1 + tau / dt); }
+  filter(v, t) {
+    if (this.x === null) { this.x = v; this.t = t; return v; }
+    const dt = Math.max(1e-3, (t - this.t) / 1000); this.t = t;
+    const dxr = (v - this.x) / dt;
+    this.dx = this.dx + this.alpha(this.dc, dt) * (dxr - this.dx);
+    const cut = this.mc + this.beta * Math.abs(this.dx);
+    this.x = this.x + this.alpha(cut, dt) * (v - this.x);
+    return this.x;
+  }
+  reset() { this.x = null; }
+}
+let fx, fy;
+function makeFilters() {
+  // 平滑 1..10 -> 截止频率 2.0 .. 0.3 Hz
+  const mc = 2.2 - settings.smooth * 0.19;
+  fx = new OneEuro(mc, 0.05); fy = new OneEuro(mc, 0.05);
+}
+
+/* =====================================================================
+   4. 打字板：停留选择
+   ===================================================================== */
+let level = null;        // null = 一级；否则是分组对象
+let tokens = [];
+let gazeKey = null, gazeSince = 0, lastSeenOnKey = 0, refractoryUntil = 0, lastGaze = null;
+
+function enterBoard() {
+  show("board");
+  $("#toolbar").style.display = "";
+  makeFilters();
+  renderGrid();
+  applySettingsUI();
+  gazeKey = null;
+}
+
+function renderGrid() {
+  grid.style.gridTemplateColumns = `repeat(${COLS}, 1fr)`;
+  grid.style.gridTemplateRows = `repeat(${ROWS}, 1fr)`;
+  grid.innerHTML = "";
+  let cells;
+  if (!level) cells = BOARD;
+  else {
+    cells = level.items.map(t => ({ label: t, type: t === "清空" ? "fn" : "text", fn: t === "清空" ? "clear" : undefined }));
+    cells.push({ label: "返回", type: "fn", fn: "back" });
+  }
+  for (const c of cells) {
+    const el = document.createElement("div");
+    el.className = "key " + (c.type === "group" ? "group" : c.type === "fn" ? "fn" : "") + (c.fn === "clear" || c.fn === "delete" ? " danger" : "");
+    el.innerHTML = `<svg class="ring" viewBox="0 0 100 100"><circle class="bgc" cx="50" cy="50" r="46"/><circle class="fgc" cx="50" cy="50" r="46" stroke-dasharray="289" stroke-dashoffset="289"/></svg><span class="label">${c.label}</span>`;
+    el._cell = c;
+    // 家属也可以直接点按，方便测试
+    el.addEventListener("click", () => fire(el));
+    grid.appendChild(el);
+  }
+}
+
+function fire(el) {
+  const c = el._cell;
+  el.classList.add("fired");
+  setTimeout(() => el.classList.remove("fired"), 350);
+  if (c.type === "group") { level = c; renderGrid(); }
+  else if (c.type === "text") {
+    tokens.push(c.label);
+    renderOutput();
+    if (settings.speak) speak(c.label);
+    level = null; renderGrid();           // 选完一个词自动回到一级
+  } else if (c.fn === "back") { level = null; renderGrid(); }
+  else if (c.fn === "delete") { tokens.pop(); renderOutput(); }
+  else if (c.fn === "clear") { tokens = []; renderOutput(); level = null; renderGrid(); }
+  else if (c.fn === "speak") { speak(tokens.join("")); }
+  refractoryUntil = performance.now() + 700;
+  gazeKey = null;
+}
+
+function renderOutput() {
+  outputText.innerHTML = tokens.length ? `<span>${tokens.join("")}</span>` : `<span class="ph">眼睛停在字上，就会打出来</span>`;
+  outputText.scrollLeft = outputText.scrollWidth;
+}
+
+function speak(text) {
+  if (!text || !("speechSynthesis" in window)) return;
+  try {
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "zh-CN"; u.rate = 0.95;
+    const v = speechSynthesis.getVoices().find(v => /zh[-_]CN/i.test(v.lang)) || speechSynthesis.getVoices().find(v => /^zh/i.test(v.lang));
+    if (v) u.voice = v;
+    speechSynthesis.speak(u);
+  } catch (e) { console.warn(e); }
+}
+
+function boardTick() {
+  const now = performance.now();
+  if (!latestFeatures || !model) {
+    statusBox.innerHTML = `<span class="bad">没看到脸</span>`;
+    gazeDot.classList.remove("show");
+    return;
+  }
+  // 闭眼时保持上一位置，不更新
+  let gx, gy;
+  if (latestBlink < 0.5) {
+    const [px, py] = predict(latestFeatures);
+    const sx = fx.filter(px, now), sy = fy.filter(py, now);
+    gx = Math.min(1, Math.max(0, sx)) * innerWidth; gy = Math.min(1, Math.max(0, sy)) * innerHeight;
+    lastGaze = [gx, gy];
+  } else if (lastGaze) { [gx, gy] = lastGaze; } else return;
+
+  if (settings.showdot) { gazeDot.classList.add("show"); gazeDot.style.left = gx + "px"; gazeDot.style.top = gy + "px"; }
+  else gazeDot.classList.remove("show");
+  statusBox.innerHTML = `${fps.toFixed(0)} 帧/秒<br>${latestBlink > 0.5 ? "闭眼" : "追踪中"}`;
+
+  if (now < refractoryUntil) return;
+  const hit = document.elementFromPoint(gx, gy)?.closest?.(".key") || null;
+
+  if (hit && hit === gazeKey) {
+    lastSeenOnKey = now;
+  } else if (hit && gazeKey && now - lastSeenOnKey < 250) {
+    // 短暂飘出去又回来，不打断
+    return;
+  } else {
+    if (gazeKey) { gazeKey.classList.remove("gaze"); setRing(gazeKey, 0); }
+    gazeKey = hit; gazeSince = now; lastSeenOnKey = now;
+    if (hit) hit.classList.add("gaze");
+    return;
+  }
+  const p = Math.min(1, (now - gazeSince) / settings.dwell);
+  setRing(gazeKey, p);
+  if (p >= 1) {
+    const el = gazeKey;
+    el.classList.remove("gaze"); setRing(el, 0);
+    fire(el);
+  }
+}
+function setRing(el, p) { const c = el.querySelector(".fgc"); if (c) c.setAttribute("stroke-dashoffset", String(289 * (1 - p))); }
+
+/* =====================================================================
+   5. 设置面板
+   ===================================================================== */
+const sDwell = $("#s-dwell"), sSmooth = $("#s-smooth"), sSpeak = $("#s-speak"), sShow = $("#s-showdot"), sPrev = $("#s-preview");
+function applySettingsUI() {
+  sDwell.value = settings.dwell; $("#s-dwell-v").textContent = (settings.dwell / 1000).toFixed(1) + " 秒";
+  sSmooth.value = settings.smooth; $("#s-smooth-v").textContent = settings.smooth;
+  sSpeak.checked = settings.speak; sShow.checked = settings.showdot; sPrev.checked = settings.preview;
+  $("#mini-preview").classList.toggle("show", settings.preview);
+  $("#s-info").textContent = model ? `标定误差约为屏幕宽度的 ${(model.err * 100).toFixed(1)}%（越小越好，超过 15% 建议重新标定）。标定时间：${new Date(model.t).toLocaleString()}` : "";
+}
+function persist() { saveJSON("eyetyper.settings", settings); applySettingsUI(); }
+sDwell.oninput = () => { settings.dwell = +sDwell.value; persist(); };
+sSmooth.oninput = () => { settings.smooth = +sSmooth.value; makeFilters(); persist(); };
+sSpeak.onchange = () => { settings.speak = sSpeak.checked; persist(); };
+sShow.onchange = () => { settings.showdot = sShow.checked; persist(); };
+sPrev.onchange = () => { settings.preview = sPrev.checked; persist(); };
+$("#btn-settings").onclick = () => $("#settings").classList.add("open");
+$("#s-close").onclick = () => $("#settings").classList.remove("open");
+$("#s-clear").onclick = () => { tokens = []; renderOutput(); $("#settings").classList.remove("open"); };
+$("#s-recal").onclick = () => { $("#settings").classList.remove("open"); startCalibration(); };
+
+/* =====================================================================
+   6. 启动
+   ===================================================================== */
+btnStart.onclick = () => { speechSynthesis?.getVoices?.(); startCalibration(); };
+btnSkip.onclick = () => { if (model) enterBoard(); };
+
+(async () => {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("这个浏览器不支持摄像头。请用 Safari（iPad）或 Chrome（Android/电脑）打开，并确保网址是 https 开头。");
+    faceStatus.textContent = "正在打开摄像头…";
+    await startCamera();
+    faceStatus.textContent = "正在加载人脸模型（首次约 20MB，请稍等）…";
+    await loadModel();
+    faceStatus.textContent = "模型就绪，请把脸对准画面";
+    btnStart.disabled = false;
+    loop();
+  } catch (e) {
+    console.error(e);
+    errBox.textContent = "启动失败：" + (e.message || e) + "\n\n常见原因：没有允许摄像头权限；网址不是 https；摄像头被其他应用占用。";
+    faceStatus.textContent = "";
+  }
+})();
+</script>
+</body>
+</html>
