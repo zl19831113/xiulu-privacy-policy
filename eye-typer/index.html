@@ -172,6 +172,8 @@
     <small>眼睛在一个字上停多久算选中。误选多就调长，太累就调短。</small>
     <label>平滑程度 <input type="range" id="s-smooth" min="1" max="10" step="1"><span class="val" id="s-smooth-v"></span></label>
     <small>越大越稳，但反应会慢一点。</small>
+    <label>自动漂移校正 <input type="checkbox" id="s-autofix"></label>
+    <small>每次选中一个字，程序就按视线和格子中心的差悄悄修正偏移。感觉越用越偏就关掉它并点 ⌖。</small>
     <label>选中后朗读 <input type="checkbox" id="s-speak"></label>
     <label>显示视线点 <input type="checkbox" id="s-showdot"></label>
     <label>显示摄像头小窗 <input type="checkbox" id="s-preview"></label>
@@ -203,7 +205,7 @@ const BOARD = [
 const COLS = 3, ROWS = 3;
 
 /* ---------------- 设置 ---------------- */
-const DEFAULTS = { dwell: 1200, smooth: 7, speak: true, showdot: true, preview: false };
+const DEFAULTS = { dwell: 1200, smooth: 7, speak: true, showdot: true, preview: false, autofix: true };
 let settings = loadJSON("eyetyper.settings", DEFAULTS);
 function loadJSON(k, d) { try { const v = localStorage.getItem(k); return v ? { ...d, ...JSON.parse(v) } : d; } catch { return d; } }
 function saveJSON(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
@@ -450,14 +452,10 @@ function fitModel(samples) {
   for (let i = 0; i < d; i++) std[i] = Math.sqrt(std[i]) || 1;
   mean[0] = 0; std[0] = 1; // 常数项不标准化
   const X = samples.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
-  // 正则强度随样本数变化：眼睛特征轻罚，头部角度重罚
-  const lambdas = new Array(d).fill(0).map((_, i) => i === 0 ? 0 : i >= HEAD_FEATURE_START ? 0.5 * n : 0.03 * n);
-  const wx = ridge(X, samples.map(s => s.x), lambdas);
-  const wy = ridge(X, samples.map(s => s.y), lambdas);
-  // 留一点交叉验证：轮流拿掉一个标定点，用其余 8 个点预测它，得到更真实的误差
   const idxs = [...new Set(samples.map(s => s.idx))];
-  let err = 0;
-  if (idxs.length >= 5) {
+  // 留一点交叉验证：轮流拿掉一个标定点，用其余点预测它，得到更真实的误差
+  function loo(lambdas) {
+    let err = 0;
     for (const k of idxs) {
       const tr = samples.filter(s => s.idx !== k), te = samples.filter(s => s.idx === k);
       const Xt = tr.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
@@ -467,8 +465,18 @@ function fitModel(samples) {
       for (const s of te) { const z = s.f.map((v, i) => (v - mean[i]) / std[i]); ex += dotp(ax, z) / te.length; ey += dotp(ay, z) / te.length; }
       err += Math.hypot(ex - te[0].x, ey - te[0].y) / idxs.length;
     }
+    return err;
   }
-  return { wx, wy, mean, std, err };
+  // 头部角度的正则强度用交叉验证自动挑选：头动得多的人需要它参与，头稳的人它只会添乱
+  let best = null;
+  for (const headL of (idxs.length >= 5 ? [0.05, 0.2, 1, 5] : [1])) {
+    const lambdas = new Array(d).fill(0).map((_, i) => i === 0 ? 0 : i >= HEAD_FEATURE_START ? headL * n : 0.03 * n);
+    const err = idxs.length >= 5 ? loo(lambdas) : 0;
+    if (!best || err < best.err) best = { err, lambdas, headL };
+  }
+  const wx = ridge(X, samples.map(s => s.x), best.lambdas);
+  const wy = ridge(X, samples.map(s => s.y), best.lambdas);
+  return { wx, wy, mean, std, err: best.err, headL: best.headL };
 }
 
 function dotp(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
@@ -648,7 +656,7 @@ function boardTick() {
 
   if (settings.showdot) { gazeDot.classList.add("show"); gazeDot.style.left = gx + "px"; gazeDot.style.top = gy + "px"; }
   else gazeDot.classList.remove("show");
-  statusBox.innerHTML = `${fps.toFixed(0)} 帧/秒<br>${latestBlink > 0.5 ? "闭眼" : "追踪中"}`;
+  statusBox.innerHTML = `${fps.toFixed(0)} 帧/秒<br>${latestBlink > 0.5 ? "闭眼" : "追踪中"} 偏移 ${((model.ox || 0) * 100).toFixed(0)},${((model.oy || 0) * 100).toFixed(0)}`;
 
   if (now < refractoryUntil) return;
   const hit = keyAt(gx, gy);
@@ -660,17 +668,37 @@ function boardTick() {
     return;
   } else {
     if (gazeKey) { gazeKey.classList.remove("gaze"); setRing(gazeKey, 0); }
-    gazeKey = hit; gazeSince = now; lastSeenOnKey = now;
+    gazeKey = hit; gazeSince = now; lastSeenOnKey = now; dwellAcc = [0, 0, 0];
     if (hit) hit.classList.add("gaze");
     return;
   }
   const p = Math.min(1, (now - gazeSince) / settings.dwell);
   setRing(gazeKey, p);
+  if (latestBlink < 0.5 && p > 0.3) { dwellAcc[0] += gx; dwellAcc[1] += gy; dwellAcc[2]++; }
   if (p >= 1) {
     const el = gazeKey;
     el.classList.remove("gaze"); setRing(el, 0);
+    if (settings.autofix) autoCorrect(el);
     fire(el);
   }
+}
+
+// 自动漂移校正：用户停留选中一个格子，说明视线大致在格子中心附近。
+// 把"预测点"和"格子中心"的差的一部分补进偏移量，边用边校正。
+let dwellAcc = [0, 0, 0];
+function autoCorrect(el) {
+  if (!model || dwellAcc[2] < 5) return;
+  const r = el.getBoundingClientRect();
+  const cx = (r.left + r.right) / 2 / innerWidth, cy = (r.top + r.bottom) / 2 / innerHeight;
+  const gx = dwellAcc[0] / dwellAcc[2] / innerWidth, gy = dwellAcc[1] / dwellAcc[2] / innerHeight;
+  // 预测点在格子内部本来就有自由度，只把超出"格子中心 ±1/4 格"的部分当作偏移
+  const hw = r.width / innerWidth / 4, hh = r.height / innerHeight / 4;
+  const rx = Math.sign(cx - gx) * Math.max(0, Math.abs(cx - gx) - hw);
+  const ry = Math.sign(cy - gy) * Math.max(0, Math.abs(cy - gy) - hh);
+  const clamp = (v, m) => Math.max(-m, Math.min(m, v));
+  model.ox = clamp((model.ox || 0) + clamp(0.5 * rx, 0.06), 0.4);
+  model.oy = clamp((model.oy || 0) + clamp(0.5 * ry, 0.06), 0.4);
+  saveJSON("eyetyper.model", model);
 }
 // 找视线所在格子。已经停留的格子向外扩 15%，视线要明显进入别的格子才切换。
 function keyAt(x, y) {
@@ -692,11 +720,11 @@ function setRing(el, p) { const c = el.querySelector(".fgc"); if (c) c.setAttrib
 /* =====================================================================
    5. 设置面板
    ===================================================================== */
-const sDwell = $("#s-dwell"), sSmooth = $("#s-smooth"), sSpeak = $("#s-speak"), sShow = $("#s-showdot"), sPrev = $("#s-preview");
+const sDwell = $("#s-dwell"), sSmooth = $("#s-smooth"), sSpeak = $("#s-speak"), sShow = $("#s-showdot"), sPrev = $("#s-preview"), sAuto = $("#s-autofix");
 function applySettingsUI() {
   sDwell.value = settings.dwell; $("#s-dwell-v").textContent = (settings.dwell / 1000).toFixed(1) + " 秒";
   sSmooth.value = settings.smooth; $("#s-smooth-v").textContent = settings.smooth;
-  sSpeak.checked = settings.speak; sShow.checked = settings.showdot; sPrev.checked = settings.preview;
+  sSpeak.checked = settings.speak; sShow.checked = settings.showdot; sPrev.checked = settings.preview; sAuto.checked = settings.autofix;
   $("#mini-preview").classList.toggle("show", settings.preview);
   $("#s-info").textContent = model ? `标定误差约为屏幕的 ${(model.err * 100).toFixed(0)}%（3×3 格子需要低于 17%，低于 10% 才算好；偏高就重新标定）。标定时间：${new Date(model.t).toLocaleString()}` : "";
 }
@@ -704,6 +732,7 @@ function persist() { saveJSON("eyetyper.settings", settings); applySettingsUI();
 sDwell.oninput = () => { settings.dwell = +sDwell.value; persist(); };
 sSmooth.oninput = () => { settings.smooth = +sSmooth.value; makeFilters(); persist(); };
 sSpeak.onchange = () => { settings.speak = sSpeak.checked; persist(); };
+sAuto.onchange = () => { settings.autofix = sAuto.checked; persist(); };
 sShow.onchange = () => { settings.showdot = sShow.checked; persist(); };
 sPrev.onchange = () => { settings.preview = sPrev.checked; persist(); };
 $("#btn-settings").onclick = () => $("#settings").classList.add("open");
