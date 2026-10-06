@@ -139,6 +139,7 @@
   <div id="mode-pick" style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
     <label style="font-size:18px;display:flex;align-items:center;gap:6px;background:#1a1e26;padding:10px 16px;border-radius:12px"><input type="radio" name="mode" value="eye" checked> 用眼睛控制</label>
     <label style="font-size:18px;display:flex;align-items:center;gap:6px;background:#1a1e26;padding:10px 16px;border-radius:12px"><input type="radio" name="mode" value="head"> 用头控制（像 EVA）</label>
+    <label style="font-size:18px;display:flex;align-items:center;gap:6px;background:#1a1e26;padding:10px 16px;border-radius:12px"><input type="radio" name="mode" value="both"> 头和眼睛一起</label>
   </div>
   <p id="mode-tip" style="font-size:15px"></p>
   <button id="btn-start" class="big-btn" disabled>开始标定</button>
@@ -332,7 +333,7 @@ const HEAD_FEATURE_START = 8;
 // 对最近几帧的特征取中位数，压掉关键点抖动
 const FEAT_HIST = [];
 function medianFeatures(f) {
-  FEAT_HIST.push(f); if (FEAT_HIST.length > 5) FEAT_HIST.shift();
+  FEAT_HIST.push(f); if (FEAT_HIST.length > (settings.mode === "eye" ? 5 : 3)) FEAT_HIST.shift();
   if (FEAT_HIST.length < 3) return f;
   return f.map((_, i) => { const a = FEAT_HIST.map(x => x[i]).sort((p, q) => p - q); return a[a.length >> 1]; });
 }
@@ -393,16 +394,17 @@ const CALIB_ORDER = [4, 0, 2, 8, 6, 1, 5, 7, 3];
 let calibrating = false;
 let calibIdx = 0, calibPhase = "move", calibPhaseT = 0;
 let calibSamples = [];   // {f: features, x, y}
-const APP_VERSION = "v0.8";
+const APP_VERSION = "v0.9";
 $("#ver").textContent = APP_VERSION;
-const MODEL_VERSION = 4;
+const MODEL_VERSION = 5;
 let model = loadJSON("eyetyper.model", null);
 if (model && (model.v !== MODEL_VERSION || !model.wx)) model = null;   // 旧版本标定作废
 if (model && model.mode !== settings.mode) model = null;   // 模式换了，标定要重做
 if (model) btnSkip.style.display = "";
 
+let calibRound = 0;   // "both" 模式：0 = 头不动只用眼，1 = 转头去看
 function startCalibration() {
-  calibSamples = []; calibIdx = 0; calibPhase = "move"; calibPhaseT = performance.now();
+  calibSamples = []; calibIdx = 0; calibRound = 0; calibPhase = "move"; calibPhaseT = performance.now();
   calibrating = true;
   show("calib");
   $("#toolbar").style.display = "none";
@@ -414,8 +416,11 @@ function placeDot() {
   dot.style.left = (x * 100) + "%";
   dot.style.top = (y * 100) + "%";
   dot.classList.remove("collecting");
-  calibMsg.textContent = `请看着蓝点（${calibIdx + 1} / ${CALIB_POINTS.length}）`;
-  $("#calib-sub").textContent = settings.mode === "head" ? "把头转过去，用鼻尖指着蓝点。" : "像平时看手机一样看着点，头可以自然地微动。";
+  const roundTxt = settings.mode === "both" ? `第 ${calibRound + 1} 轮，` : "";
+  calibMsg.textContent = `${roundTxt}请看着蓝点（${calibIdx + 1} / ${CALIB_POINTS.length}）`;
+  $("#calib-sub").textContent = settings.mode === "head" ? "把头转过去，用鼻尖指着蓝点。"
+    : settings.mode === "both" ? (calibRound === 0 ? "第一轮：头保持不动，只用眼睛看点。" : "第二轮：把头转过去看点，眼睛自然跟着。")
+    : "像平时看手机一样看着点，头可以自然地微动。";
 }
 
 function calibTick() {
@@ -428,11 +433,15 @@ function calibTick() {
   if (calibPhase === "collect") {
     if (latestFeatures && latestBlink < 0.5) {
       const [x, y] = CALIB_POINTS[CALIB_ORDER[calibIdx]];
-      calibSamples.push({ f: latestFeatures, x, y, idx: calibIdx, aux: latestAux });
+      calibSamples.push({ f: latestFeatures, x, y, idx: calibIdx + calibRound * CALIB_POINTS.length, aux: latestAux });
     }
     if (el > 1300) {
       calibIdx++;
-      if (calibIdx >= CALIB_POINTS.length) { if (settings.mode === "head") finishCalibration(); else startHeadPhase(now); return; }
+      if (calibIdx >= CALIB_POINTS.length) {
+        if (settings.mode === "both" && calibRound === 0) { calibRound = 1; calibIdx = 0; calibPhase = "move"; calibPhaseT = now; placeDot(); return; }
+        if (settings.mode === "eye") startHeadPhase(now); else finishCalibration();
+        return;
+      }
       calibPhase = "move"; calibPhaseT = now; placeDot();
     }
     return;
@@ -519,6 +528,13 @@ function fitModel(samples) {
   }
   // 头部角度的正则强度用交叉验证自动挑选：头动得多的人需要它参与，头稳的人它只会添乱
   const HUGE = 1e9;
+  if (settings.mode === "both") {
+    // 头眼联合：两轮标定里头的参与程度不同，回归能把头的增益和眼睛的增益分开学
+    const lambdas = new Array(d).fill(0).map((_, i) => i === 0 ? 0 : 0.03 * n);
+    const r = idxs.length >= 5 ? loo(lambdas) : { err: 0, errx: 0, erry: 0 };
+    const wx = ridge(X, samples.map(s => s.x), lambdas), wy = ridge(X, samples.map(s => s.y), lambdas);
+    return { wx, wy, mean, std, lo, hi, err: r.err, errx: r.errx, erry: r.erry, headL: "联合" };
+  }
   if (settings.mode === "head") {
     // 头动模式：只用头部姿态和位置，眼睛信号全部压掉
     const lambdas = new Array(d).fill(0).map((_, i) => i === 0 ? 0 : i >= HEAD_FEATURE_START ? 0.01 * n : HUGE);
@@ -691,8 +707,11 @@ class OneEuro {
 let fx, fy;
 function makeFilters() {
   // 平滑 1..10 -> 截止频率 1.5 .. 0.2 Hz
-  const mc = 1.64 - settings.smooth * 0.144;
-  fx = new OneEuro(mc, 0.02); fy = new OneEuro(mc, 0.02);
+  let mc = 1.64 - settings.smooth * 0.144, beta = 0.02;
+  // 头的姿态信号比虹膜稳得多，平滑可以轻很多，并且随速度自动放开，大幅移动时不拖泥带水
+  if (settings.mode === "head") { mc = mc * 3 + 0.5; beta = 0.5; }
+  else if (settings.mode === "both") { mc = mc * 2 + 0.3; beta = 0.3; }
+  fx = new OneEuro(mc, beta); fy = new OneEuro(mc, beta);
 }
 
 /* =====================================================================
@@ -883,6 +902,7 @@ if (Math.max(innerWidth, innerHeight) < 900) $("#small-warn").style.display = ""
 const MODE_TIPS = {
   eye: "眼睛控制：头尽量少动。标定最后会让你盯着中心点、慢慢动头十几秒，用来学习头动时怎么补偿。",
   head: "头控制：完全用头的转动来指，眼睛不参与，不怕眼睛疲劳，对手机摄像头更稳。标定时把头转向每个蓝点。",
+  both: "头和眼睛一起：标定分两轮，第一轮头不动只用眼睛看点，第二轮转头去看点。之后头转多少、眼睛转多少都可以，模型两边都会算。",
 };
 function applyMode() {
   document.querySelectorAll('input[name="mode"]').forEach(r => { r.checked = r.value === settings.mode; });
