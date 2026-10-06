@@ -383,7 +383,7 @@ const CALIB_ORDER = [4, 0, 2, 8, 6, 1, 5, 7, 3];
 let calibrating = false;
 let calibIdx = 0, calibPhase = "move", calibPhaseT = 0;
 let calibSamples = [];   // {f: features, x, y}
-const APP_VERSION = "v0.4";
+const APP_VERSION = "v0.5";
 $("#ver").textContent = APP_VERSION;
 const MODEL_VERSION = 2;
 let model = loadJSON("eyetyper.model", null);
@@ -461,8 +461,14 @@ function fitModel(samples) {
   const mean = new Array(d).fill(0), std = new Array(d).fill(0);
   for (const s of samples) for (let i = 0; i < d; i++) mean[i] += s.f[i] / n;
   for (const s of samples) for (let i = 0; i < d; i++) std[i] += (s.f[i] - mean[i]) ** 2 / n;
-  for (let i = 0; i < d; i++) std[i] = Math.sqrt(std[i]) || 1;
+  // 每项信号的最小尺度：标定时头几乎不动，头部角度的标准差会接近 0，
+  // 之后头稍微一动就被放大成巨大的输入。用固定下限兜住。
+  const MIN_STD = [1, 0.02, 0.02, 0.002, 0.002, 0.002, 0.08, 0.08, 0.06, 0.06];
+  for (let i = 0; i < d; i++) std[i] = Math.max(Math.sqrt(std[i]), MIN_STD[i] || 1e-3);
   mean[0] = 0; std[0] = 1; // 常数项不标准化
+  // 标定时各信号的范围（标准化后），预测时超出范围就截断，防止外推乱跑
+  const lo = new Array(d).fill(Infinity), hi = new Array(d).fill(-Infinity);
+  for (const s of samples) for (let i = 0; i < d; i++) { const z = (s.f[i] - mean[i]) / std[i]; if (z < lo[i]) lo[i] = z; if (z > hi[i]) hi[i] = z; }
   const X = samples.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
   const idxs = [...new Set(samples.map(s => s.idx))];
   // 留一点交叉验证：轮流拿掉一个标定点，用其余点预测它，得到更真实的误差
@@ -481,14 +487,14 @@ function fitModel(samples) {
   }
   // 头部角度的正则强度用交叉验证自动挑选：头动得多的人需要它参与，头稳的人它只会添乱
   let best = null;
-  for (const headL of (idxs.length >= 5 ? [0.05, 0.2, 1, 5] : [1])) {
+  for (const headL of (idxs.length >= 5 ? [0.5, 2, 10, 1e6] : [10])) {
     const lambdas = new Array(d).fill(0).map((_, i) => i === 0 ? 0 : i >= HEAD_FEATURE_START ? headL * n : 0.03 * n);
     const err = idxs.length >= 5 ? loo(lambdas) : 0;
     if (!best || err < best.err) best = { err, lambdas, headL };
   }
   const wx = ridge(X, samples.map(s => s.x), best.lambdas);
   const wy = ridge(X, samples.map(s => s.y), best.lambdas);
-  return { wx, wy, mean, std, err: best.err, headL: best.headL };
+  return { wx, wy, mean, std, lo, hi, err: best.err, headL: best.headL };
 }
 
 function dotp(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
@@ -521,8 +527,15 @@ function ridge(X, y, lambdas) {
   return A.map(r => r[d]);
 }
 
+function zfeat(f) {
+  return f.map((v, i) => {
+    let z = (v - model.mean[i]) / model.std[i];
+    if (model.lo) { const m = 0.3 * (model.hi[i] - model.lo[i]) + 0.5; z = Math.max(model.lo[i] - m, Math.min(model.hi[i] + m, z)); }
+    return z;
+  });
+}
 function predict(f) {
-  const z = f.map((v, i) => (v - model.mean[i]) / model.std[i]);
+  const z = zfeat(f);
   return [dotp(model.wx, z) + (model.ox || 0), dotp(model.wy, z) + (model.oy || 0)];
 }
 
@@ -538,13 +551,15 @@ function startRecenter() {
 }
 function recenterTick() {
   const el = performance.now() - recenterT;
-  if (el > 800 && el < 2300 && latestFeatures && latestBlink < 0.5) {
-    const z = latestFeatures.map((v, i) => (v - model.mean[i]) / model.std[i]);
+  calibMsg.textContent = el < 1500 ? "请看着屏幕中心的蓝点" : "保持住…";
+  if (el > 1500 && el < 3000 && latestFeatures && latestBlink < 0.5) {
+    const z = zfeat(latestFeatures);
     recenterBuf.push([dotp(model.wx, z), dotp(model.wy, z)]);
   }
-  if (el >= 2300) {
+  if (el >= 3000) {
     recentering = false;
-    if (recenterBuf.length >= 8) {
+    const spread = recenterBuf.length >= 8 ? Math.hypot(mad(recenterBuf.map(p => p[0])), mad(recenterBuf.map(p => p[1]))) : 1;
+    if (recenterBuf.length >= 8 && spread < 0.12) {
       const mx = median(recenterBuf.map(p => p[0])), my = median(recenterBuf.map(p => p[1]));
       model.ox = 0.5 - mx; model.oy = 0.5 - my;
       saveJSON("eyetyper.model", model);
@@ -566,7 +581,7 @@ function diagTick() {
   const el = performance.now() - diagT;
   calibMsg.textContent = `漂移诊断：请一直看着中心的蓝点，头不要动（${Math.max(0, 20 - el / 1000).toFixed(0)} 秒）`;
   if (latestFeatures && latestBlink < 0.5) {
-    const z = latestFeatures.map((v, i) => (v - model.mean[i]) / model.std[i]);
+    const z = zfeat(latestFeatures);
     diagBuf.push({ t: el / 1000, f: latestFeatures, px: dotp(model.wx, z), py: dotp(model.wy, z) });
   }
   if (el < 20000) return;
@@ -588,6 +603,7 @@ function diagTick() {
   dot.style.display = "none";
   $("#diag").onclick = () => { $("#diag").style.display = "none"; dot.style.display = ""; enterBoard(); };
 }
+function mad(a) { const m = median(a); return median(a.map(v => Math.abs(v - m))); }
 function median(a) { const b = [...a].sort((p, q) => p - q); return b[b.length >> 1]; }
 
 /* =====================================================================
@@ -707,7 +723,7 @@ function boardTick() {
 
   if (settings.showdot) { gazeDot.classList.add("show"); gazeDot.style.left = gx + "px"; gazeDot.style.top = gy + "px"; }
   else gazeDot.classList.remove("show");
-  statusBox.innerHTML = `${APP_VERSION} · ${fps.toFixed(0)} 帧/秒<br>${latestBlink > 0.5 ? "闭眼" : "追踪中"} 偏移 ${((model.ox || 0) * 100).toFixed(0)},${((model.oy || 0) * 100).toFixed(0)}`;
+  statusBox.innerHTML = `${APP_VERSION} · ${fps.toFixed(0)} 帧/秒 · 误差 ${(model.err * 100).toFixed(0)}% · 头${model.headL >= 1e6 ? "关" : model.headL}<br>${latestBlink > 0.5 ? "闭眼" : "追踪中"} 偏移 ${((model.ox || 0) * 100).toFixed(0)},${((model.oy || 0) * 100).toFixed(0)}`;
 
   if (now < refractoryUntil) return;
   const hit = keyAt(gx, gy);
@@ -747,8 +763,8 @@ function autoCorrect(el) {
   const hw = r.width / innerWidth / 2, hh = r.height / innerHeight / 2;
   if (Math.abs(cx - gx) > 0.7 * hw || Math.abs(cy - gy) > 0.7 * hh) return;
   const clamp = (v, m) => Math.max(-m, Math.min(m, v));
-  model.ox = clamp((model.ox || 0) + 0.3 * (cx - gx), 0.4);
-  model.oy = clamp((model.oy || 0) + 0.3 * (cy - gy), 0.4);
+  model.ox = clamp((model.ox || 0) + 0.2 * (cx - gx), 0.4);
+  model.oy = clamp((model.oy || 0) + 0.2 * (cy - gy), 0.4);
   saveJSON("eyetyper.model", model);
 }
 // 找视线所在格子。已经停留的格子向外扩 15%，视线要明显进入别的格子才切换。
