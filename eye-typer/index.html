@@ -136,6 +136,11 @@
   <div id="face-status">正在加载摄像头和模型…</div>
   <div id="small-warn" style="display:none;color:#ffb74d;font-size:16px;max-width:640px;line-height:1.5">⚠️ 当前屏幕较小。手机屏幕上眼睛左右转动幅度太小，识别会很不准，建议用平板或电脑，并横屏使用。</div>
   <div id="err"></div>
+  <div id="mode-pick" style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
+    <label style="font-size:18px;display:flex;align-items:center;gap:6px;background:#1a1e26;padding:10px 16px;border-radius:12px"><input type="radio" name="mode" value="eye" checked> 用眼睛控制</label>
+    <label style="font-size:18px;display:flex;align-items:center;gap:6px;background:#1a1e26;padding:10px 16px;border-radius:12px"><input type="radio" name="mode" value="head"> 用头控制（像 EVA）</label>
+  </div>
+  <p id="mode-tip" style="font-size:15px"></p>
   <button id="btn-start" class="big-btn" disabled>开始标定</button>
   <button id="btn-skip" class="link-btn" style="display:none">使用上次的标定，直接进入打字板</button>
 </section>
@@ -213,7 +218,7 @@ function columns() {
 }
 
 /* ---------------- 设置 ---------------- */
-const DEFAULTS = { dwell: 1200, smooth: 7, speak: true, showdot: true, preview: false, autofix: true, cols: 0 };
+const DEFAULTS = { dwell: 1200, smooth: 7, speak: true, showdot: true, preview: false, autofix: false, cols: 0, mode: "eye" };
 addEventListener("resize", () => { if ($("#board").classList.contains("active")) renderGrid(); });
 let settings = loadJSON("eyetyper.settings", DEFAULTS);
 function loadJSON(k, d) { try { const v = localStorage.getItem(k); return v ? { ...d, ...JSON.parse(v) } : d; } catch { return d; } }
@@ -388,11 +393,12 @@ const CALIB_ORDER = [4, 0, 2, 8, 6, 1, 5, 7, 3];
 let calibrating = false;
 let calibIdx = 0, calibPhase = "move", calibPhaseT = 0;
 let calibSamples = [];   // {f: features, x, y}
-const APP_VERSION = "v0.7";
+const APP_VERSION = "v0.8";
 $("#ver").textContent = APP_VERSION;
-const MODEL_VERSION = 3;
+const MODEL_VERSION = 4;
 let model = loadJSON("eyetyper.model", null);
 if (model && (model.v !== MODEL_VERSION || !model.wx)) model = null;   // 旧版本标定作废
+if (model && model.mode !== settings.mode) model = null;   // 模式换了，标定要重做
 if (model) btnSkip.style.display = "";
 
 function startCalibration() {
@@ -409,7 +415,7 @@ function placeDot() {
   dot.style.top = (y * 100) + "%";
   dot.classList.remove("collecting");
   calibMsg.textContent = `请看着蓝点（${calibIdx + 1} / ${CALIB_POINTS.length}）`;
-  $("#calib-sub").textContent = "像平时看手机一样看着点，头可以自然地微动。";
+  $("#calib-sub").textContent = settings.mode === "head" ? "把头转过去，用鼻尖指着蓝点。" : "像平时看手机一样看着点，头可以自然地微动。";
 }
 
 function calibTick() {
@@ -426,7 +432,7 @@ function calibTick() {
     }
     if (el > 1300) {
       calibIdx++;
-      if (calibIdx >= CALIB_POINTS.length) { startHeadPhase(now); return; }
+      if (calibIdx >= CALIB_POINTS.length) { if (settings.mode === "head") finishCalibration(); else startHeadPhase(now); return; }
       calibPhase = "move"; calibPhaseT = now; placeDot();
     }
     return;
@@ -459,7 +465,7 @@ function finishCalibration() {
   const fit = fitModel(calibSamples);
   const auxs = calibSamples.filter(s => s.aux).map(s => s.aux);
   const head0 = auxs.length ? { nx: median(auxs.map(a => a.nx)), ny: median(auxs.map(a => a.ny)), ipd: median(auxs.map(a => a.ipd)) } : null;
-  model = { ...fit, ox: 0, oy: 0, head0, t: Date.now(), v: MODEL_VERSION };
+  model = { ...fit, ox: 0, oy: 0, head0, t: Date.now(), v: MODEL_VERSION, mode: settings.mode };
   saveJSON("eyetyper.model", model);
   enterBoard();
 }
@@ -497,10 +503,10 @@ function fitModel(samples) {
   const X = samples.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
   const idxs = [...new Set(samples.map(s => s.idx))].filter(i => i !== HEAD_IDX);
   // 留一点交叉验证：轮流拿掉一个标定点，用其余点预测它，得到更真实的误差
-  function loo(lambdas) {
+  function loo(lambdas, pool = samples) {
     let err = 0, errx = 0, erry = 0;
     for (const k of idxs) {
-      const tr = samples.filter(s => s.idx !== k), te = samples.filter(s => s.idx === k);
+      const tr = pool.filter(s => s.idx !== k), te = pool.filter(s => s.idx === k);
       const Xt = tr.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
       const lt = lambdas.map(l => l * tr.length / n);
       const ax = ridge(Xt, tr.map(s => s.x), lt), ay = ridge(Xt, tr.map(s => s.y), lt);
@@ -512,16 +518,34 @@ function fitModel(samples) {
     return { err, errx, erry };
   }
   // 头部角度的正则强度用交叉验证自动挑选：头动得多的人需要它参与，头稳的人它只会添乱
-  let best = null;
-  const hasHead = samples.some(s => s.idx === HEAD_IDX);
-  for (const headL of (idxs.length >= 5 ? (hasHead ? [0.03, 0.1, 0.5, 2, 1e6] : [0.5, 2, 10, 1e6]) : [10])) {
-    const lambdas = new Array(d).fill(0).map((_, i) => i === 0 ? 0 : i >= HEAD_FEATURE_START ? headL * n : 0.03 * n);
+  const HUGE = 1e9;
+  if (settings.mode === "head") {
+    // 头动模式：只用头部姿态和位置，眼睛信号全部压掉
+    const lambdas = new Array(d).fill(0).map((_, i) => i === 0 ? 0 : i >= HEAD_FEATURE_START ? 0.01 * n : HUGE);
     const r = idxs.length >= 5 ? loo(lambdas) : { err: 0, errx: 0, erry: 0 };
-    if (!best || r.err < best.err) best = { ...r, lambdas, headL };
+    const wx = ridge(X, samples.map(s => s.x), lambdas), wy = ridge(X, samples.map(s => s.y), lambdas);
+    return { wx, wy, mean, std, lo, hi, err: r.err, errx: r.errx, erry: r.erry, headL: "head" };
   }
-  const wx = ridge(X, samples.map(s => s.x), best.lambdas);
-  const wy = ridge(X, samples.map(s => s.y), best.lambdas);
-  return { wx, wy, mean, std, lo, hi, err: best.err, errx: best.errx, erry: best.erry, headL: best.headL };
+  // 眼动模式，分两步：
+  // 第一步只用 9 个点（头基本不动）拟合眼睛信号 -> 屏幕位置，头部项压为 0。
+  const eyeSamples = samples.filter(s => s.idx !== HEAD_IDX);
+  const lamEye = new Array(d).fill(0).map((_, i) => i === 0 ? 0 : i >= HEAD_FEATURE_START ? HUGE : 0.03 * eyeSamples.length);
+  const r = idxs.length >= 5 ? loo(lamEye, eyeSamples) : { err: 0, errx: 0, erry: 0 };
+  const Xe = eyeSamples.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
+  const wx = ridge(Xe, eyeSamples.map(s => s.x), lamEye), wy = ridge(Xe, eyeSamples.map(s => s.y), lamEye);
+  // 第二步用"盯着中心、头在动"的数据：眼睛模型此时的预测与 0.5 的差，完全归因于头部项，
+  // 只对头部项做回归。这样眼睛权重不会被头动数据改写，头部补偿也不会和眼睛信号互相抢。
+  const headSamples = samples.filter(s => s.idx === HEAD_IDX);
+  let headL = "无";
+  if (headSamples.length >= 30) {
+    const Xh = headSamples.map(s => s.f.map((v, i) => (v - mean[i]) / std[i]));
+    const rx = Xh.map(z => 0.5 - dotp(wx, z)), ry = Xh.map(z => 0.5 - dotp(wy, z));
+    const lamHead = new Array(d).fill(0).map((_, i) => i === 0 ? 0 : i >= HEAD_FEATURE_START ? 0.1 * headSamples.length : HUGE);
+    const kx = ridge(Xh, rx, lamHead), ky = ridge(Xh, ry, lamHead);
+    for (let i = 0; i < d; i++) { if (i === 0 || i >= HEAD_FEATURE_START) { wx[i] += kx[i]; wy[i] += ky[i]; } }
+    headL = "两步";
+  }
+  return { wx, wy, mean, std, lo, hi, err: r.err, errx: r.errx, erry: r.erry, headL };
 }
 
 function dotp(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
@@ -856,6 +880,16 @@ $("#s-diag").onclick = () => { $("#settings").classList.remove("open"); startDia
    6. 启动
    ===================================================================== */
 if (Math.max(innerWidth, innerHeight) < 900) $("#small-warn").style.display = "";
+const MODE_TIPS = {
+  eye: "眼睛控制：头尽量少动。标定最后会让你盯着中心点、慢慢动头十几秒，用来学习头动时怎么补偿。",
+  head: "头控制：完全用头的转动来指，眼睛不参与，不怕眼睛疲劳，对手机摄像头更稳。标定时把头转向每个蓝点。",
+};
+function applyMode() {
+  document.querySelectorAll('input[name="mode"]').forEach(r => { r.checked = r.value === settings.mode; });
+  $("#mode-tip").textContent = MODE_TIPS[settings.mode] || "";
+}
+document.querySelectorAll('input[name="mode"]').forEach(r => r.addEventListener("change", () => { settings.mode = r.value; saveJSON("eyetyper.settings", settings); applyMode(); btnSkip.style.display = (model && model.mode === settings.mode) ? "" : "none"; }));
+applyMode();
 btnStart.onclick = () => { speechSynthesis?.getVoices?.(); startCalibration(); };
 btnSkip.onclick = () => { if (model) enterBoard(); };
 
