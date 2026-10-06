@@ -145,6 +145,7 @@
   <div id="calib-msg">请看着蓝点</div>
   <div id="dot"></div>
   <div id="calib-sub">头保持不动，只转动眼睛。</div>
+  <pre id="diag" style="display:none;position:absolute;inset:0;margin:0;padding:24px;background:#000;color:#ddd;font-size:15px;line-height:1.6;overflow:auto;white-space:pre-wrap"></pre>
 </section>
 
 <!-- ============ 打字板 ============ -->
@@ -172,6 +173,7 @@
     <small>眼睛在一个字上停多久算选中。误选多就调长，太累就调短。</small>
     <label>平滑程度 <input type="range" id="s-smooth" min="1" max="10" step="1"><span class="val" id="s-smooth-v"></span></label>
     <small>越大越稳，但反应会慢一点。</small>
+    <label>列数 <select id="s-cols"><option value="0">自动（竖屏 2 列，横屏 3 列）</option><option value="2">2 列</option><option value="3">3 列</option></select></label>
     <label>自动漂移校正 <input type="checkbox" id="s-autofix"></label>
     <small>每次选中一个字，程序就按视线和格子中心的差悄悄修正偏移。感觉越用越偏就关掉它并点 ⌖。</small>
     <label>选中后朗读 <input type="checkbox" id="s-speak"></label>
@@ -179,6 +181,7 @@
     <label>显示摄像头小窗 <input type="checkbox" id="s-preview"></label>
     <div class="row">
       <button id="s-recal" class="primary">重新标定</button>
+      <button id="s-diag">漂移诊断（20 秒）</button>
       <button id="s-clear">清空文字</button>
       <button id="s-close">关闭</button>
     </div>
@@ -201,11 +204,17 @@ const BOARD = [
   { label: "数字", type: "group", items: ["1", "2", "3", "4", "5", "6", "7", "8"] },
   { label: "删除", type: "fn", fn: "delete" },
   { label: "朗读", type: "fn", fn: "speak" },
+  { label: "校正", type: "fn", fn: "recenter" },
 ];
-const COLS = 3, ROWS = 3;
+// 列数：竖屏手机用 2 列（左右可分辨的角度太小），横屏或平板用 3 列。设置里可强制。
+function columns() {
+  if (settings.cols === 2 || settings.cols === 3) return settings.cols;
+  return innerWidth < innerHeight ? 2 : 3;
+}
 
 /* ---------------- 设置 ---------------- */
-const DEFAULTS = { dwell: 1200, smooth: 7, speak: true, showdot: true, preview: false, autofix: true };
+const DEFAULTS = { dwell: 1200, smooth: 7, speak: true, showdot: true, preview: false, autofix: true, cols: 0 };
+addEventListener("resize", () => { if ($("#board").classList.contains("active")) renderGrid(); });
 let settings = loadJSON("eyetyper.settings", DEFAULTS);
 function loadJSON(k, d) { try { const v = localStorage.getItem(k); return v ? { ...d, ...JSON.parse(v) } : d; } catch { return d; } }
 function saveJSON(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
@@ -359,6 +368,7 @@ function loop() {
 
   if (calibrating) calibTick();
   else if (recentering) recenterTick();
+  else if (diagOn) diagTick();
   else if ($("#board").classList.contains("active")) boardTick();
 }
 
@@ -540,6 +550,42 @@ function recenterTick() {
     enterBoard();
   }
 }
+/* ---------- 漂移诊断：看中心点 20 秒，记录每项信号，对比前 5 秒和后 5 秒 ---------- */
+const FEAT_NAMES = ["常数", "虹膜左右", "虹膜上下", "左右²", "上下²", "左右×上下", "眼球左右(模型)", "眼球上下(模型)", "头偏航", "头俯仰"];
+let diagOn = false, diagT = 0, diagBuf = [];
+function startDiag() {
+  if (!model) return;
+  diagOn = true; diagT = performance.now(); diagBuf = [];
+  show("calib"); $("#toolbar").style.display = "none"; $("#diag").style.display = "none";
+  dot.style.display = ""; dot.style.left = "50%"; dot.style.top = "50%"; dot.classList.add("collecting");
+  calibMsg.textContent = "漂移诊断：请一直看着中心的蓝点，头不要动（20 秒）";
+}
+function diagTick() {
+  const el = performance.now() - diagT;
+  calibMsg.textContent = `漂移诊断：请一直看着中心的蓝点，头不要动（${Math.max(0, 20 - el / 1000).toFixed(0)} 秒）`;
+  if (latestFeatures && latestBlink < 0.5) {
+    const z = latestFeatures.map((v, i) => (v - model.mean[i]) / model.std[i]);
+    diagBuf.push({ t: el / 1000, f: latestFeatures, px: dotp(model.wx, z), py: dotp(model.wy, z) });
+  }
+  if (el < 20000) return;
+  diagOn = false;
+  const a = diagBuf.filter(s => s.t < 5), b = diagBuf.filter(s => s.t > 15);
+  const avg = (arr, fn) => arr.reduce((s, x) => s + fn(x), 0) / (arr.length || 1);
+  const lines = [`漂移诊断结果（样本 ${diagBuf.length} 帧）`, "", `预测点 X：开始 ${(avg(a, s => s.px) * 100).toFixed(0)}% → 结束 ${(avg(b, s => s.px) * 100).toFixed(0)}%（目标 50%）`, `预测点 Y：开始 ${(avg(a, s => s.py) * 100).toFixed(0)}% → 结束 ${(avg(b, s => s.py) * 100).toFixed(0)}%（目标 50%）`, "", "各项信号变化（单位：标定时该信号的标准差；绝对值大的就是漂移来源）"];
+  const rows = [];
+  for (let i = 1; i < FEAT_NAMES.length; i++) {
+    const d = (avg(b, s => s.f[i]) - avg(a, s => s.f[i])) / model.std[i];
+    const wx = model.wx[i] * d, wy = model.wy[i] * d;
+    rows.push({ i, d, wx, wy });
+  }
+  rows.sort((p, q) => Math.abs(q.wx) + Math.abs(q.wy) - Math.abs(p.wx) - Math.abs(p.wy));
+  for (const r of rows) lines.push(`${FEAT_NAMES[r.i].padEnd(9, "　")} 变化 ${r.d.toFixed(2).padStart(6)}   对X影响 ${(r.wx * 100).toFixed(1).padStart(6)}%   对Y影响 ${(r.wy * 100).toFixed(1).padStart(6)}%`);
+  lines.push("", `模型里头部角度的约束档位：${model.headL ?? "-"}`, "", "请截图发给开发者。点任意位置返回打字板。");
+  $("#diag").textContent = lines.join("\n");
+  $("#diag").style.display = "";
+  dot.style.display = "none";
+  $("#diag").onclick = () => { $("#diag").style.display = "none"; dot.style.display = ""; enterBoard(); };
+}
 function median(a) { const b = [...a].sort((p, q) => p - q); return b[b.length >> 1]; }
 
 /* =====================================================================
@@ -583,15 +629,17 @@ function enterBoard() {
 }
 
 function renderGrid() {
-  grid.style.gridTemplateColumns = `repeat(${COLS}, 1fr)`;
-  grid.style.gridTemplateRows = `repeat(${ROWS}, 1fr)`;
   grid.innerHTML = "";
   let cells;
   if (!level) cells = BOARD;
   else {
     cells = level.items.map(t => ({ label: t, type: t === "清空" ? "fn" : "text", fn: t === "清空" ? "clear" : undefined }));
     cells.push({ label: "返回", type: "fn", fn: "back" });
+    cells.push({ label: "删除", type: "fn", fn: "delete" });
   }
+  const cols = columns(), rows = Math.ceil(cells.length / cols);
+  grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+  grid.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
   for (const c of cells) {
     const el = document.createElement("div");
     el.className = "key " + (c.type === "group" ? "group" : c.type === "fn" ? "fn" : "") + (c.fn === "clear" || c.fn === "delete" ? " danger" : "");
@@ -617,6 +665,7 @@ function fire(el) {
   else if (c.fn === "delete") { tokens.pop(); renderOutput(); }
   else if (c.fn === "clear") { tokens = []; renderOutput(); level = null; renderGrid(); }
   else if (c.fn === "speak") { speak(tokens.join("")); }
+  else if (c.fn === "recenter") { startRecenter(); return; }
   refractoryUntil = performance.now() + 700;
   gazeKey = null;
 }
@@ -691,13 +740,13 @@ function autoCorrect(el) {
   const r = el.getBoundingClientRect();
   const cx = (r.left + r.right) / 2 / innerWidth, cy = (r.top + r.bottom) / 2 / innerHeight;
   const gx = dwellAcc[0] / dwellAcc[2] / innerWidth, gy = dwellAcc[1] / dwellAcc[2] / innerHeight;
-  // 预测点在格子内部本来就有自由度，只把超出"格子中心 ±1/4 格"的部分当作偏移
-  const hw = r.width / innerWidth / 4, hh = r.height / innerHeight / 4;
-  const rx = Math.sign(cx - gx) * Math.max(0, Math.abs(cx - gx) - hw);
-  const ry = Math.sign(cy - gy) * Math.max(0, Math.abs(cy - gy) - hh);
+  // 视线靠近格子边缘时，很可能选错了格子，这时不校正，避免越校越偏。
+  // 视线明显在格子内部时，才把它向格子中心轻轻拉一点。
+  const hw = r.width / innerWidth / 2, hh = r.height / innerHeight / 2;
+  if (Math.abs(cx - gx) > 0.7 * hw || Math.abs(cy - gy) > 0.7 * hh) return;
   const clamp = (v, m) => Math.max(-m, Math.min(m, v));
-  model.ox = clamp((model.ox || 0) + clamp(0.5 * rx, 0.06), 0.4);
-  model.oy = clamp((model.oy || 0) + clamp(0.5 * ry, 0.06), 0.4);
+  model.ox = clamp((model.ox || 0) + 0.3 * (cx - gx), 0.4);
+  model.oy = clamp((model.oy || 0) + 0.3 * (cy - gy), 0.4);
   saveJSON("eyetyper.model", model);
 }
 // 找视线所在格子。已经停留的格子向外扩 15%，视线要明显进入别的格子才切换。
@@ -725,6 +774,7 @@ function applySettingsUI() {
   sDwell.value = settings.dwell; $("#s-dwell-v").textContent = (settings.dwell / 1000).toFixed(1) + " 秒";
   sSmooth.value = settings.smooth; $("#s-smooth-v").textContent = settings.smooth;
   sSpeak.checked = settings.speak; sShow.checked = settings.showdot; sPrev.checked = settings.preview; sAuto.checked = settings.autofix;
+  $("#s-cols").value = String(settings.cols || 0);
   $("#mini-preview").classList.toggle("show", settings.preview);
   $("#s-info").textContent = model ? `标定误差约为屏幕的 ${(model.err * 100).toFixed(0)}%（3×3 格子需要低于 17%，低于 10% 才算好；偏高就重新标定）。标定时间：${new Date(model.t).toLocaleString()}` : "";
 }
@@ -733,6 +783,7 @@ sDwell.oninput = () => { settings.dwell = +sDwell.value; persist(); };
 sSmooth.oninput = () => { settings.smooth = +sSmooth.value; makeFilters(); persist(); };
 sSpeak.onchange = () => { settings.speak = sSpeak.checked; persist(); };
 sAuto.onchange = () => { settings.autofix = sAuto.checked; persist(); };
+$("#s-cols").onchange = () => { settings.cols = +$("#s-cols").value; persist(); renderGrid(); };
 sShow.onchange = () => { settings.showdot = sShow.checked; persist(); };
 sPrev.onchange = () => { settings.preview = sPrev.checked; persist(); };
 $("#btn-settings").onclick = () => $("#settings").classList.add("open");
@@ -740,6 +791,7 @@ $("#btn-recenter").onclick = () => startRecenter();
 $("#s-close").onclick = () => $("#settings").classList.remove("open");
 $("#s-clear").onclick = () => { tokens = []; renderOutput(); $("#settings").classList.remove("open"); };
 $("#s-recal").onclick = () => { $("#settings").classList.remove("open"); startCalibration(); };
+$("#s-diag").onclick = () => { $("#settings").classList.remove("open"); startDiag(); };
 
 /* =====================================================================
    6. 启动
