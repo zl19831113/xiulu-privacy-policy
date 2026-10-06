@@ -127,7 +127,7 @@
 
 <!-- ============ 开始页 ============ -->
 <section id="start" class="screen active">
-  <h1>眼控打字板</h1>
+  <h1>眼控打字板 <small id="ver" style="font-size:14px;color:#8a93a6;font-weight:400"></small></h1>
   <p>把平板放在正前方约 40 到 60 厘米，让脸出现在画面中间。光线要照到脸上，背后不要有强光。准备好后点"开始标定"，接下来会出现 9 个蓝点，请用眼睛依次看着每个点，头尽量保持不动。</p>
   <div id="preview-wrap">
     <video id="video" playsinline autoplay muted></video>
@@ -383,6 +383,8 @@ const CALIB_ORDER = [4, 0, 2, 8, 6, 1, 5, 7, 3];
 let calibrating = false;
 let calibIdx = 0, calibPhase = "move", calibPhaseT = 0;
 let calibSamples = [];   // {f: features, x, y}
+const APP_VERSION = "v0.4";
+$("#ver").textContent = APP_VERSION;
 const MODEL_VERSION = 2;
 let model = loadJSON("eyetyper.model", null);
 if (model && (model.v !== MODEL_VERSION || !model.wx)) model = null;   // 旧版本标定作废
@@ -705,7 +707,7 @@ function boardTick() {
 
   if (settings.showdot) { gazeDot.classList.add("show"); gazeDot.style.left = gx + "px"; gazeDot.style.top = gy + "px"; }
   else gazeDot.classList.remove("show");
-  statusBox.innerHTML = `${fps.toFixed(0)} 帧/秒<br>${latestBlink > 0.5 ? "闭眼" : "追踪中"} 偏移 ${((model.ox || 0) * 100).toFixed(0)},${((model.oy || 0) * 100).toFixed(0)}`;
+  statusBox.innerHTML = `${APP_VERSION} · ${fps.toFixed(0)} 帧/秒<br>${latestBlink > 0.5 ? "闭眼" : "追踪中"} 偏移 ${((model.ox || 0) * 100).toFixed(0)},${((model.oy || 0) * 100).toFixed(0)}`;
 
   if (now < refractoryUntil) return;
   const hit = keyAt(gx, gy);
